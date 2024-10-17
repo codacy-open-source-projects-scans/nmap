@@ -113,6 +113,8 @@ struct iocp_engine_info {
 
   /* How many Completion Packets we actually retreieved */
   unsigned long entries_removed;
+  /* Number of IODs incompatible with IO completion ports */
+  int num_pcap_nonselect;
 
   gh_list_t active_eovs;
   gh_list_t free_eovs;
@@ -131,7 +133,7 @@ struct extended_overlapped {
   nsock_event_id nse_id;
 /* We need a way to mark canceled I/O that doesn't interfere with real NSE IDs.
  * -1 is 0xffffffff, so the lower bits will always be greater than NSE_TYPE_MAX
- * and therefore invalid. 0 is already invalid, so works for the recycled case. 
+ * and therefore invalid. 0 is already invalid, so works for the recycled case.
  */
 #define NSEID_CANCELED ((nsock_event_id) -1)
 #define NSEID_FREED    ((nsock_event_id)  0)
@@ -163,7 +165,6 @@ struct extended_overlapped {
 
 /* --- INTERNAL PROTOTYPES --- */
 static void iterate_through_event_lists(struct npool *nsp);
-static void iterate_through_pcap_events(struct npool *nsp);
 static void terminate_overlapped_event(struct npool *nsp, struct nevent *nse);
 static void initiate_overlapped_event(struct npool *nsp, struct nevent *nse);
 static int get_overlapped_result(struct npool *nsp, int fd, const void *buffer, size_t count, struct sockaddr* src_addr, socklen_t* addrlen);
@@ -176,9 +177,8 @@ void process_iod_events(struct npool *nsp, struct niod *nsi, int ev);
 void process_event(struct npool *nsp, gh_list_t *evlist, struct nevent *nse, int ev);
 void process_expired_events(struct npool *nsp);
 #if HAVE_PCAP
-#ifndef PCAP_CAN_DO_SELECT
 int pcap_read_on_nonselect(struct npool *nsp);
-#endif
+void iterate_through_pcap_events(struct npool *nsp);
 #endif
 
 /* defined in nsock_event.c */
@@ -200,6 +200,7 @@ int iocp_init(struct npool *nsp) {
   iinfo->eov = NULL;
   iinfo->entries_removed = 0;
   iinfo->eov_list = (OVERLAPPED_ENTRY *)safe_malloc(iinfo->capacity * sizeof(OVERLAPPED_ENTRY));
+  iinfo->num_pcap_nonselect = 0;
   nsp->engine_data = (void *)iinfo;
 
   return 1;
@@ -237,13 +238,24 @@ void iocp_destroy(struct npool *nsp) {
 }
 
 int iocp_iod_register(struct npool *nsp, struct niod *iod, struct nevent *nse, int ev) {
+  int sd;
   struct iocp_engine_info *iinfo = (struct iocp_engine_info *)nsp->engine_data;
   HANDLE result;
 
   assert(!IOD_PROPGET(iod, IOD_REGISTERED));
   iod->watched_events = ev;
-  result = CreateIoCompletionPort((HANDLE)iod->sd, iinfo->iocp, NULL, 0);
-  assert(result);
+
+  sd = nsock_iod_get_sd(iod);
+  if (sd == -1) {
+    if (iod->pcap)
+      iinfo->num_pcap_nonselect++;
+    else
+      fatal("Unable to get descriptor for IOD #%lu", iod->id);
+  }
+  else {
+    result = CreateIoCompletionPort((HANDLE)sd, iinfo->iocp, NULL, 0);
+    assert(result && result == iinfo->iocp);
+  }
 
   IOD_PROPSET(iod, IOD_REGISTERED);
 
@@ -254,10 +266,20 @@ int iocp_iod_register(struct npool *nsp, struct niod *iod, struct nevent *nse, i
 
 /* Sadly a socket can't be unassociated with a completion port */
 int iocp_iod_unregister(struct npool *nsp, struct niod *iod) {
+  int sd;
+  struct iocp_engine_info *iinfo = (struct iocp_engine_info *)nsp->engine_data;
 
   if (IOD_PROPGET(iod, IOD_REGISTERED)) {
-    /* Nuke all uncompleted operations on that iod */
-    CancelIo((HANDLE)iod->sd);
+    sd = nsock_iod_get_sd(iod);
+    if (sd == -1) {
+      assert(iod->pcap);
+      iinfo->num_pcap_nonselect--;
+    }
+    else {
+      /* Nuke all uncompleted operations on that iod */
+      CancelIo((HANDLE)iod->sd);
+    }
+
     IOD_PROPCLR(iod, IOD_REGISTERED);
   }
 
@@ -265,41 +287,20 @@ int iocp_iod_unregister(struct npool *nsp, struct niod *iod) {
 }
 
 int iocp_iod_modify(struct npool *nsp, struct niod *iod, struct nevent *nse, int ev_set, int ev_clr) {
-  int new_events;
   struct iocp_engine_info *iinfo = (struct iocp_engine_info *)nsp->engine_data;
 
   assert((ev_set & ev_clr) == 0);
   assert(IOD_PROPGET(iod, IOD_REGISTERED));
 
-  new_events = iod->watched_events;
-  new_events |= ev_set;
-  new_events &= ~ev_clr;
-
-  if (new_events == iod->watched_events)
-      return 1; /* nothing to do */
-
-  iod->watched_events = new_events;
-  switch (nse->type) {
-  case NSE_TYPE_CONNECT:
-  case NSE_TYPE_CONNECT_SSL:
-      break;
-  case NSE_TYPE_READ:
-  case NSE_TYPE_PCAP_READ:
-      assert((ev_set | ev_clr) == EV_READ);
-      break;
-  case NSE_TYPE_WRITE:
-      assert((ev_set | ev_clr) == EV_WRITE);
-      break;
-  default:
-      fatal("Invalid NSE type %d for iocp_iod_modify", nse->type);
-      break;
-  }
+  // Bookkeeping, but we don't care about watched_events:
+  iod->watched_events |= ev_set;
+  iod->watched_events &= ~ev_clr;
 
   if (ev_set != EV_NONE) {
       if (!nse->eov)
           initiate_overlapped_event(nsp, nse);
   }
-  else if (ev_clr != EV_NONE)
+  else /* even if ev_clr is EV_NONE, since other events may preclude that */
     terminate_overlapped_event(nsp, nse);
 
   return 1;
@@ -339,32 +340,31 @@ int iocp_loop(struct npool *nsp, int msec_timeout) {
   }
 
 #if HAVE_PCAP
-#ifndef PCAP_CAN_DO_SELECT
-  /* Force a low timeout when capturing packets on systems where
-  * the pcap descriptor is not select()able. */
-  if (gh_list_count(&nsp->pcap_read_events) > 0)
-  if (event_msecs > PCAP_POLL_INTERVAL)
-    event_msecs = PCAP_POLL_INTERVAL;
-#endif
+    if (iinfo->num_pcap_nonselect > 0 && gh_list_count(&nsp->pcap_read_events) > 0) {
+
+      /* do non-blocking read on pcap devices that doesn't support select()
+       * If there is anything read, just leave this loop. */
+      if (pcap_read_on_nonselect(nsp)) {
+        /* okay, something was read. */
+        // Check all pcap events that won't be signaled
+        gettimeofday(&nsock_tod, NULL);
+        iterate_through_pcap_events(nsp);
+        // Make the system call non-blocking
+        event_msecs = 0;
+      }
+      /* Force a low timeout when capturing packets on systems where
+       * the pcap descriptor is not select()able. */
+      else if (event_msecs > PCAP_POLL_INTERVAL) {
+        event_msecs = PCAP_POLL_INTERVAL;
+      }
+    }
 #endif
 
   /* We cast to unsigned because we want -1 to be very high (since it means no
   * timeout) */
   combined_msecs = MIN((unsigned)event_msecs, (unsigned)msec_timeout);
 
-#if HAVE_PCAP
-#ifndef PCAP_CAN_DO_SELECT
-  /* do non-blocking read on pcap devices that doesn't support select()
-  * If there is anything read, just leave this loop. */
-  if (pcap_read_on_nonselect(nsp)) {
-    /* okay, something was read. */
-    gettimeofday(&nsock_tod, NULL);
-    iterate_through_pcap_events(nsp);
-  }
-  else
-#endif
-#endif
-  {
+  if (total_events > 0) {
     /* It is mandatory these values are reset before calling GetQueuedCompletionStatusEx */
     iinfo->entries_removed = 0;
     memset(iinfo->eov_list, 0, iinfo->capacity * sizeof(OVERLAPPED_ENTRY));
@@ -380,8 +380,12 @@ int iocp_loop(struct npool *nsp, int msec_timeout) {
       }
     }
     else {
-        iterate_through_event_lists(nsp);
+      iterate_through_event_lists(nsp);
     }
+  }
+  else if (combined_msecs > 0) {
+    // No compatible IODs; sleep the remainder of the wait time.
+    usleep(combined_msecs * 1000);
   }
 
   /* iterate through timers and expired events */
@@ -392,32 +396,6 @@ int iocp_loop(struct npool *nsp, int msec_timeout) {
 
 
 /* ---- INTERNAL FUNCTIONS ---- */
-
-#if HAVE_PCAP
-/* Iterate through pcap events separately, since these are not tracked in iocp_engine_info */
-void iterate_through_pcap_events(struct npool *nsp) {
-  gh_lnode_t *current, *next, *last;
-
-  last = gh_list_last_elem(&nsp->active_iods);
-
-  for (current = gh_list_first_elem(&nsp->active_iods);
-       current != NULL && gh_lnode_prev(current) != last;
-       current = next) {
-    struct niod *nsi = container_of(current, struct niod, nodeq);
-
-    if (nsi->pcap && nsi->state != NSIOD_STATE_DELETED && nsi->events_pending)
-    {
-      process_iod_events(nsp, nsi, EV_READ);
-    }
-
-    next = gh_lnode_next(current);
-    if (nsi->state == NSIOD_STATE_DELETED) {
-      gh_list_remove(&nsp->active_iods, current);
-      gh_list_prepend(&nsp->free_iods, current);
-    }
-  }
-}
-#endif
 
 /* Iterate through all the event lists (such as connect_events, read_events,
 * timer_events, etc) and take action for those that have completed (due to
@@ -505,7 +483,8 @@ void iterate_through_event_lists(struct npool *nsp) {
 
       if (nse->timeout.tv_sec)
         gh_heap_remove(&nsp->expirables, &nse->expire);
-      assert(!nse->eov);
+      if (nse->eov)
+          terminate_overlapped_event(nsp, nse);
     }
     else {
         assert(nse->eov->forced_operation != IOCP_NOT_FORCED);
