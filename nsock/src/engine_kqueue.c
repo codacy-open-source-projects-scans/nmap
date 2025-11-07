@@ -3,7 +3,7 @@
  *                                                                         *
  ***********************IMPORTANT NSOCK LICENSE TERMS***********************
  *
- * The nsock parallel socket event library is (C) 1999-2024 Nmap Software LLC
+ * The nsock parallel socket event library is (C) 1999-2025 Nmap Software LLC
  * This library is free software; you may redistribute and/or modify it under
  * the terms of the GNU General Public License as published by the Free Software
  * Foundation; Version 2. This guarantees your right to use, modify, and
@@ -158,9 +158,6 @@ int kqueue_iod_register(struct npool *nsp, struct niod *iod, struct nevent *nse,
 }
 
 int kqueue_iod_unregister(struct npool *nsp, struct niod *iod) {
-  int sd;
-  struct kqueue_engine_info *kinfo = (struct kqueue_engine_info *)nsp->engine_data;
-
   /* some IODs can be unregistered here if they're associated to an event that was
    * immediately completed */
   if (IOD_PROPGET(iod, IOD_REGISTERED)) {
