@@ -2,7 +2,7 @@
  * ncat_exec_win.c -- Windows-specific subprocess execution.               *
  ***********************IMPORTANT NMAP LICENSE TERMS************************
  *
- * The Nmap Security Scanner is (C) 1996-2025 Nmap Software LLC ("The Nmap
+ * The Nmap Security Scanner is (C) 1996-2026 Nmap Software LLC ("The Nmap
  * Project"). Nmap is also a registered trademark of the Nmap Project.
  *
  * This program is distributed under the terms of the Nmap Public Source
@@ -191,6 +191,7 @@ static int run_command_redirected(char *cmdexec, struct subprocess_info *info)
     SECURITY_ATTRIBUTES sa;
     STARTUPINFO si;
     PROCESS_INFORMATION pi;
+    char *app_name = NULL;
 
     setup_environment(&info->fdn);
 
@@ -248,7 +249,18 @@ static int run_command_redirected(char *cmdexec, struct subprocess_info *info)
 
     memset(&pi, 0, sizeof(pi));
 
-    if (CreateProcess(NULL, cmdexec, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) == 0) {
+    /* The user ought to quote the binary name if it contains spaces, but they
+     * might not. If it's not quoted, we'll try to help them out. */
+    if (cmdexec[0] != '"') {
+      DWORD dwType = 0;
+      /* Check if the whole command is just the name of an executable file. */
+      if (GetBinaryType(cmdexec, &dwType)) {
+        /* If so, pass this to CreateProcess to avoid space-splitting */
+        app_name = cmdexec;
+      }
+    }
+
+    if (CreateProcess(app_name, cmdexec, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) == 0) {
         if (o.verbose) {
             LPVOID lpMsgBuf;
             FormatMessage(
