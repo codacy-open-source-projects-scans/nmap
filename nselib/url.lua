@@ -388,30 +388,16 @@ local entities = {
 -- <code>table["name"]</code> = <code>value</code>.
 -----------------------------------------------------------------------------
 function parse_query(query)
-  local parsed = {}
-  local pos = 1
 
+  -- TODO: https://github.com/nmap/nmap/issues/3324
+  --       This opportunistic HTML decoding is problematic because
+  --       it might accidentally decode what should not be decoded.
   query = string.gsub(query, "&([ampltg]+);", entities)
-  query = string.gsub(query, "%+", " ")
 
-  local function ginsert(qstr)
-    local pos = qstr:find("=", 1, true)
-    if pos then
-      parsed[unescape(qstr:sub(1, pos - 1))] = unescape(qstr:sub(pos + 1))
-    else
-      parsed[unescape(qstr)] = ""
-    end
-  end
-
-  while true do
-    local first, last = string.find(query, "&", pos, true)
-    if first then
-      ginsert(string.sub(query, pos, first-1));
-      pos = last+1
-    else
-      ginsert(string.sub(query, pos));
-      break;
-    end
+  local parsed = {}
+  for qseg in query:gsub(query, "%+", " "):gmatch("[^&]+") do
+    local k, v = qseg:match("^([^=]*)=?(.*)")
+    parsed[unescape(k)] = unescape(v)
   end
   return parsed
 end
@@ -445,7 +431,7 @@ function get_default_port (scheme)
   return get_default_port_ports[(scheme or ""):lower()]
 end
 
-get_default_scheme_schemes = tableaux.invert(get_default_port_ports)
+local get_default_scheme_schemes = tableaux.invert(get_default_port_ports)
 
 ---
 -- Provides the default URI scheme for a given port.
