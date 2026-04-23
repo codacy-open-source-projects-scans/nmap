@@ -167,8 +167,8 @@ void PacketTrace::traceND(pdirection pdir, const u8 *frame, u32 len,
                           struct timeval *now) {
   struct timeval tv;
   struct ip6_hdr ip6;
-  const struct icmpv6_hdr *icmpv6;
-  const union icmpv6_msg *msg;
+  struct icmpv6_hdr icmpv6;
+  union icmpv6_msg msg;
   size_t msg_len;
   const char *label;
   char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
@@ -191,36 +191,36 @@ void PacketTrace::traceND(pdirection pdir, const u8 *frame, u32 len,
   else
     gettimeofday(&tv, NULL);
 
-  if (len < sizeof(ip6) + sizeof(*icmpv6)) {
+  if (len < sizeof(ip6) + sizeof(icmpv6) + sizeof(msg)) {
     error("Packet tracer: ND packets must be at least %lu bytes long (is %lu).",
-          (unsigned long) (sizeof(ip6) + sizeof(*icmpv6)),
+          (unsigned long) (sizeof(ip6) + sizeof(icmpv6) + sizeof(msg)),
           (unsigned long) len);
     return;
   }
   memcpy(&ip6, frame, sizeof(ip6));
-  icmpv6 = (struct icmpv6_hdr *) (frame + sizeof(ip6));
-  msg = (union icmpv6_msg *) (frame + sizeof(ip6) + sizeof(*icmpv6));
-  msg_len = frame + len - (u8 *) msg;
+  memcpy(&icmpv6, frame + sizeof(ip6), sizeof(icmpv6));
+  memcpy(&msg, frame + sizeof(ip6) + sizeof(icmpv6), sizeof(msg));
+  msg_len = len - (sizeof(ip6) + sizeof(icmpv6) + sizeof(msg));
 
-  if (icmpv6->icmpv6_type == ICMPV6_NEIGHBOR_SOLICITATION) {
+  if (icmpv6.icmpv6_type == ICMPV6_NEIGHBOR_SOLICITATION) {
     label = "neighbor solicitation";
     if (msg_len < 20) {
       Snprintf(desc, sizeof(desc), "packet too short");
     } else {
-      inet_ntop(AF_INET6, (void *)&msg->nd.icmpv6_target, who_has, sizeof(who_has));
+      inet_ntop(AF_INET6, (void *)&msg.nd.icmpv6_target, who_has, sizeof(who_has));
       Snprintf(desc, sizeof(desc), "who has %s", who_has);
     }
-  } else if (icmpv6->icmpv6_type == ICMPV6_NEIGHBOR_ADVERTISEMENT) {
+  } else if (icmpv6.icmpv6_type == ICMPV6_NEIGHBOR_ADVERTISEMENT) {
     label = "neighbor advertisement";
     if (msg_len < 28) {
       Snprintf(desc, sizeof(desc), "packet too short");
-    } else if (msg->nd.icmpv6_option_length == 0 || msg->nd.icmpv6_option_type != 2) {
+    } else if (msg.nd.icmpv6_option_length == 0 || msg.nd.icmpv6_option_type != 2) {
       /* We only handle target link-layer address in the first option. */
       Snprintf(desc, sizeof(desc), "no link-layer address");
     } else {
-      inet_ntop(AF_INET6, (void *)&msg->nd.icmpv6_target, tgt_is, sizeof(tgt_is));
+      inet_ntop(AF_INET6, (void *)&msg.nd.icmpv6_target, tgt_is, sizeof(tgt_is));
       Snprintf(desc, sizeof(desc), "%s is at %s",
-               tgt_is, eth_ntoa(&msg->nd.icmpv6_mac));
+               tgt_is, eth_ntoa(&msg.nd.icmpv6_mac));
     }
   } else {
     error("Unknown ICMPV6 type in %s.", __func__);
@@ -1059,8 +1059,10 @@ u8 *build_icmpv6_raw(const struct in6_addr *source,
   }
 
   /* At this point icmplen <= sizeof(*icmpv6) + sizeof(*msg). */
-  memcpy(packet + icmplen, data, datalen);
-  icmplen += datalen;
+  if (data && datalen) {
+    memcpy(packet + icmplen, data, datalen);
+    icmplen += datalen;
+  }
 
   icmpv6->icmpv6_cksum = 0;
   icmpv6->icmpv6_cksum = ipv6_pseudoheader_cksum(source, victim,
@@ -1215,54 +1217,6 @@ int readtcppacket(const u8 *packet, int readdata) {
   return 0;
 }
 
-/* A simple function I wrote to help in debugging, shows the important fields
-   of a UDP packet*/
-int readudppacket(const u8 *packet, int readdata) {
-  const struct ip *ip = (struct ip *) packet;
-  const struct udp_hdr *udp = (struct udp_hdr *) (packet + sizeof(struct ip));
-  const unsigned char *data = packet + sizeof(struct ip) + sizeof(struct udp_hdr);
-  int tot_len;
-  struct in_addr bullshit, bullshit2;
-  char sourcehost[16];
-  int i;
-  int realfrag = 0;
-
-  if (!packet) {
-    error("%s: packet is NULL!", __func__);
-    return -1;
-  }
-
-  bullshit.s_addr = ip->ip_src.s_addr;
-  bullshit2.s_addr = ip->ip_dst.s_addr;
-  realfrag = htons(ntohs(ip->ip_off) & IP_OFFMASK);
-  tot_len = htons(ip->ip_len);
-  strncpy(sourcehost, inet_ntoa(bullshit), 16);
-  i = 4 * (ntohs(ip->ip_hl)) + 8;
-  if (ip->ip_p == IPPROTO_UDP) {
-    if (realfrag)
-      log_write(LOG_PLAIN, "Packet is fragmented, offset field: %u\n",
-                realfrag);
-    else {
-      log_write(LOG_PLAIN,
-                "UDP packet: %s:%d -> %s:%d (total: %d bytes)\n",
-                sourcehost, ntohs(udp->uh_sport), inet_ntoa(bullshit2),
-                ntohs(udp->uh_dport), tot_len);
-
-      log_write(LOG_PLAIN, "ttl: %hhu ", ip->ip_ttl);
-    }
-  }
-  if (readdata && i < tot_len) {
-    log_write(LOG_PLAIN, "Data portion:\n");
-    while (i < tot_len) {
-      log_write(LOG_PLAIN, "%2X%c", data[i], ((i + 1) % 16) ? ' ' : '\n');
-      i++;
-    }
-    log_write(LOG_PLAIN, "\n");
-  }
-  return 0;
-}
-
-
 /* Used by validatepkt() to validate the TCP header (including option lengths).
    The options checked are MSS, WScale, SackOK, Sack, and Timestamp. */
 static bool validateTCPhdr(const u8 *tcpc, unsigned len) {
@@ -1358,16 +1312,12 @@ static bool validateTCPhdr(const u8 *tcpc, unsigned len) {
  */
 static bool validatepkt(const u8 *ipc, unsigned *len) {
   struct ip ip;
+  if (*len < sizeof(ip))
+    return false;
   memcpy(&ip, ipc, sizeof(ip));
   const void *data;
   unsigned int datalen, iplen;
   u8 hdr;
-
-  if (*len < 1) {
-    if (o.debugging >= 3)
-      error("Rejecting tiny, supposed IP packet (size %u)", *len);
-    return false;
-  }
 
   if (ip.ip_v == 4) {
     unsigned fragoff, iplen;
@@ -1398,6 +1348,8 @@ static bool validatepkt(const u8 *ipc, unsigned *len) {
     hdr = ip.ip_p;
   } else if (ip.ip_v == 6) {
     struct ip6_hdr ip6;
+    if (*len < sizeof(ip6))
+      return false;
     memcpy(&ip6, ipc, sizeof(ip6));
 
     datalen = *len;
